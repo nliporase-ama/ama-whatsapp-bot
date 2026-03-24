@@ -11,7 +11,6 @@ const pino = require("pino");
 const axios = require("axios");
 const fs = require("fs");
 const path = require("path");
-const QRCode = require("qrcode-terminal");
 
 // =====================================================
 // CONFIG
@@ -19,6 +18,7 @@ const QRCode = require("qrcode-terminal");
 const PORT = process.env.PORT || 3000;
 const N8N_WEBHOOK_URL = process.env.N8N_WEBHOOK_URL || "https://nickliporase.app.n8n.cloud/webhook/ama-bot-incoming";
 const GROQ_API_KEY = process.env.GROQ_API_KEY || "";
+const PHONE_NUMBER = process.env.PHONE_NUMBER || "";
 const AUTH_DIR = path.join(__dirname, "..", "auth_info");
 
 // =====================================================
@@ -143,7 +143,7 @@ async function startBot() {
     auth: state,
     logger: pino({ level: "warn" }),
     printQRInTerminal: false,
-    browser: ["AMA Pet Bot", "Chrome", "1.0.0"],
+    browser: ["Chrome (Linux)", "", ""],
     connectTimeoutMs: 60000,
     defaultQueryTimeoutMs: 0,
     keepAliveIntervalMs: 30000,
@@ -153,10 +153,23 @@ async function startBot() {
 
   sock.ev.on("connection.update", async ({ connection, lastDisconnect, qr }) => {
     if (qr) {
-      console.log("\n========================================");
-      console.log("  ESCANEA ESTE QR CON WHATSAPP");
-      console.log("========================================\n");
-      QRCode.generate(qr, { small: true });
+      if (PHONE_NUMBER && !sock.authState.creds.registered) {
+        try {
+          const code = await sock.requestPairingCode(PHONE_NUMBER);
+          console.log("\n========================================");
+          console.log("  CODIGO DE VINCULACION: " + code);
+          console.log("  Ingresalo en WhatsApp > Dispositivos");
+          console.log("  vinculados > Vincular con numero");
+          console.log("========================================\n");
+        } catch (err) {
+          console.error("Error requesting pairing code:", err.message);
+        }
+      } else {
+        console.log("\n========================================");
+        console.log("  QR disponible pero no se puede mostrar");
+        console.log("  Configura PHONE_NUMBER en variables");
+        console.log("========================================\n");
+      }
       connectionStatus = "waiting_qr";
     }
 
@@ -248,5 +261,6 @@ app.listen(PORT, () => {
   console.log(`\n[SERVER] API corriendo en puerto ${PORT}`);
   console.log(`[SERVER] Webhook n8n: ${N8N_WEBHOOK_URL}`);
   console.log(`[SERVER] Groq API: ${GROQ_API_KEY ? "Configurada" : "NO CONFIGURADA"}`);
+  console.log(`[SERVER] Phone: ${PHONE_NUMBER ? PHONE_NUMBER : "NO CONFIGURADO"}`);
   startBot();
 });
