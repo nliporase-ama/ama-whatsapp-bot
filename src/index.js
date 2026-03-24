@@ -11,6 +11,7 @@ const pino = require("pino");
 const axios = require("axios");
 const fs = require("fs");
 const path = require("path");
+const QRCode = require("qrcode-terminal");
 
 // =====================================================
 // CONFIG
@@ -46,7 +47,6 @@ app.post("/api/send-message", async (req, res) => {
       return res.status(400).json({ error: "phone and message required" });
     }
 
-    // Formata o numero pro formato WhatsApp
     const jid = formatPhoneToJid(phone);
     await sock.sendMessage(jid, { text: message });
 
@@ -120,9 +120,7 @@ async function transcribeAudio(audioBuffer) {
 // HELPERS
 // =====================================================
 function formatPhoneToJid(phone) {
-  // Remove tudo que nao for numero
   let clean = phone.replace(/\D/g, "");
-  // Se nao tem codigo de pais, assume Chile (+56)
   if (!clean.startsWith("56") && clean.length <= 9) {
     clean = "56" + clean;
   }
@@ -144,23 +142,21 @@ async function startBot() {
     version,
     auth: state,
     logger: pino({ level: "warn" }),
-    printQRInTerminal: true,
+    printQRInTerminal: false,
     browser: ["AMA Pet Bot", "Chrome", "1.0.0"],
-    // Reconexao automatica
     connectTimeoutMs: 60000,
     defaultQueryTimeoutMs: 0,
     keepAliveIntervalMs: 30000,
   });
 
-  // Salva credenciais quando atualizar
   sock.ev.on("creds.update", saveCreds);
 
-  // Gerencia conexao
   sock.ev.on("connection.update", async ({ connection, lastDisconnect, qr }) => {
     if (qr) {
       console.log("\n========================================");
       console.log("  ESCANEA ESTE QR CON WHATSAPP");
       console.log("========================================\n");
+      QRCode.generate(qr, { small: true });
       connectionStatus = "waiting_qr";
     }
 
@@ -170,7 +166,6 @@ async function startBot() {
 
       if (reason === DisconnectReason.loggedOut) {
         console.log("Session logged out. Delete auth_info and restart.");
-        // Limpa auth e reconecta
         if (fs.existsSync(AUTH_DIR)) {
           fs.rmSync(AUTH_DIR, { recursive: true });
         }
@@ -189,32 +184,24 @@ async function startBot() {
     }
   });
 
-  // =====================================================
-  // PROCESSA MENSAGENS RECEBIDAS
-  // =====================================================
   sock.ev.on("messages.upsert", async ({ messages, type }) => {
     if (type !== "notify") return;
 
     for (const msg of messages) {
-      // Ignora mensagens proprias e de grupos
       if (msg.key.fromMe) continue;
       if (msg.key.remoteJid?.endsWith("@g.us")) continue;
 
       const senderPhone = extractPhoneFromJid(msg.key.remoteJid);
-      const senderName =
-        msg.pushName || msg.key.participant || "Cliente";
+      const senderName = msg.pushName || msg.key.participant || "Cliente";
 
       let messageText = "";
       let messageType = "text";
 
-      // Texto normal
       if (msg.message?.conversation) {
         messageText = msg.message.conversation;
       } else if (msg.message?.extendedTextMessage?.text) {
         messageText = msg.message.extendedTextMessage.text;
-      }
-      // Audio / voice note
-      else if (msg.message?.audioMessage) {
+      } else if (msg.message?.audioMessage) {
         messageType = "audio";
         try {
           console.log(`[AUDIO] Recibido de ${senderPhone}, transcribiendo...`);
@@ -225,25 +212,18 @@ async function startBot() {
           console.error("Error downloading audio:", err.message);
           messageText = "[Audio no pudo ser procesado]";
         }
-      }
-      // Imagen con caption
-      else if (msg.message?.imageMessage) {
+      } else if (msg.message?.imageMessage) {
         messageType = "image";
-        messageText =
-          msg.message.imageMessage.caption || "[Imagen recibida sin texto]";
-      }
-      // Otro tipo de mensaje
-      else {
+        messageText = msg.message.imageMessage.caption || "[Imagen recibida sin texto]";
+      } else {
         messageText = "[Mensaje no soportado]";
         messageType = "other";
       }
 
-      // Ignora mensagens vazias
       if (!messageText) continue;
 
       console.log(`[MSG] ${senderName} (${senderPhone}): ${messageText}`);
 
-      // Envia pro n8n via webhook
       try {
         await axios.post(N8N_WEBHOOK_URL, {
           phone: senderPhone,
@@ -256,7 +236,6 @@ async function startBot() {
       } catch (err) {
         console.error(`[N8N] Error enviando al webhook: ${err.message}`);
 
-        // Fallback: responde que ta com problemas
         await sock.sendMessage(msg.key.remoteJid, {
           text: "Disculpa, estamos experimentando problemas tecnicos. Por favor intenta nuevamente en unos minutos o contactanos al (+56) 9 7510 2052.",
         });
@@ -265,9 +244,6 @@ async function startBot() {
   });
 }
 
-// =====================================================
-// INICIA TUDO
-// =====================================================
 app.listen(PORT, () => {
   console.log(`\n[SERVER] API corriendo en puerto ${PORT}`);
   console.log(`[SERVER] Webhook n8n: ${N8N_WEBHOOK_URL}`);
