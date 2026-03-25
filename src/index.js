@@ -31,7 +31,6 @@ let sock = null;
 let connectionStatus = "disconnected";
 let currentQR = null;
 
-// Health check
 app.get("/", (req, res) => {
   res.json({
     status: connectionStatus,
@@ -40,73 +39,54 @@ app.get("/", (req, res) => {
   });
 });
 
-// === PAGINA PARA ESCANEAR QR ===
 app.get("/pair", async (req, res) => {
   if (connectionStatus === "connected") {
     return res.send(`<html><body style="font-family:Arial;text-align:center;padding:60px;background:#0a0a0a;color:#0f0">
-      <h1>BOT CONECTADO</h1>
-      <p>WhatsApp ya esta vinculado. Todo OK.</p>
-    </body></html>`);
+      <h1>BOT CONECTADO</h1><p>WhatsApp ya esta vinculado. Todo OK.</p></body></html>`);
   }
-
   let qrImage = "";
   if (currentQR) {
-    try {
-      qrImage = await QRCode.toDataURL(currentQR, { width: 400, margin: 2 });
-    } catch (e) {
-      qrImage = "";
-    }
+    try { qrImage = await QRCode.toDataURL(currentQR, { width: 400, margin: 2 }); } catch (e) {}
   }
-
   res.send(`<html>
-  <head><meta http-equiv="refresh" content="5"><title>AMA Bot - Vincular WhatsApp</title></head>
+  <head><meta http-equiv="refresh" content="5"><title>AMA Bot - Vincular</title></head>
   <body style="font-family:Arial;text-align:center;padding:40px;background:#0a0a0a;color:#fff">
     <h1>AMA Pet WhatsApp Bot</h1>
     <p>Estado: <b style="color:${connectionStatus === 'connected' ? '#0f0' : '#f90'}">${connectionStatus}</b></p>
     ${qrImage ? `
       <div style="background:#fff;border-radius:16px;padding:20px;display:inline-block;margin:20px">
-        <img src="${qrImage}" alt="QR Code" style="width:350px;height:350px"/>
+        <img src="${qrImage}" alt="QR" style="width:350px;height:350px"/>
       </div>
-      <p style="color:#aaa">1. Abre WhatsApp en tu celular</p>
-      <p style="color:#aaa">2. Menu > Dispositivos vinculados > Vincular dispositivo</p>
-      <p style="color:#aaa">3. Escanea este QR con la camara</p>
-      <p style="color:#555;font-size:12px">La pagina se refresca cada 5 segundos. Si el QR expira, espera uno nuevo.</p>
-    ` : `
-      <p style="color:#f90;font-size:20px">Esperando QR... la pagina se actualiza sola.</p>
-      <p style="color:#555">Si tarda mucho, el bot esta reconectando. Espera unos segundos.</p>
-    `}
+      <p style="color:#aaa">Escanea con WhatsApp > Dispositivos vinculados > Vincular</p>
+    ` : `<p style="color:#f90">Esperando QR... se actualiza sola.</p>`}
   </body></html>`);
 });
 
-// Endpoint para n8n enviar mensajes
+// === N8N ENVIA MENSAJES DE VUELTA ===
+// Acepta "jid" (el JID completo tal cual) para responder
 app.post("/api/send-message", async (req, res) => {
   try {
-    const { phone, message } = req.body;
-    if (!phone || !message) {
-      return res.status(400).json({ error: "phone and message required" });
-    }
-    const jid = formatPhoneToJid(phone);
-    await sock.sendMessage(jid, { text: message });
-    res.json({ success: true, to: jid });
+    const { jid, phone, message } = req.body;
+    if (!message) return res.status(400).json({ error: "message required" });
+    if (!jid && !phone) return res.status(400).json({ error: "jid or phone required" });
+
+    const targetJid = jid || (phone.includes("@") ? phone : phone + "@s.whatsapp.net");
+    await sock.sendMessage(targetJid, { text: message });
+    console.log(`[SENT] To ${targetJid}: ${message.substring(0, 50)}...`);
+    res.json({ success: true, to: targetJid });
   } catch (err) {
     console.error("Error sending message:", err.message);
     res.status(500).json({ error: err.message });
   }
 });
 
-// Endpoint para n8n enviar imagenes
 app.post("/api/send-image", async (req, res) => {
   try {
-    const { phone, imageUrl, caption } = req.body;
-    if (!phone || !imageUrl) {
-      return res.status(400).json({ error: "phone and imageUrl required" });
-    }
-    const jid = formatPhoneToJid(phone);
-    await sock.sendMessage(jid, {
-      image: { url: imageUrl },
-      caption: caption || "",
-    });
-    res.json({ success: true, to: jid });
+    const { jid, phone, imageUrl, caption } = req.body;
+    if (!imageUrl) return res.status(400).json({ error: "imageUrl required" });
+    const targetJid = jid || (phone.includes("@") ? phone : phone + "@s.whatsapp.net");
+    await sock.sendMessage(targetJid, { image: { url: imageUrl }, caption: caption || "" });
+    res.json({ success: true, to: targetJid });
   } catch (err) {
     console.error("Error sending image:", err.message);
     res.status(500).json({ error: err.message });
@@ -117,29 +97,17 @@ app.post("/api/send-image", async (req, res) => {
 // GROQ WHISPER
 // =====================================================
 async function transcribeAudio(audioBuffer) {
-  if (!GROQ_API_KEY) {
-    return "[Audio recibido - transcripcion no disponible]";
-  }
+  if (!GROQ_API_KEY) return "[Audio recibido - transcripcion no disponible]";
   try {
     const FormData = (await import("form-data")).default;
     const form = new FormData();
-    form.append("file", audioBuffer, {
-      filename: "audio.ogg",
-      contentType: "audio/ogg",
-    });
+    form.append("file", audioBuffer, { filename: "audio.ogg", contentType: "audio/ogg" });
     form.append("model", "whisper-large-v3");
     form.append("language", "es");
-
     const response = await axios.post(
       "https://api.groq.com/openai/v1/audio/transcriptions",
       form,
-      {
-        headers: {
-          Authorization: `Bearer ${GROQ_API_KEY}`,
-          ...form.getHeaders(),
-        },
-        maxBodyLength: Infinity,
-      }
+      { headers: { Authorization: `Bearer ${GROQ_API_KEY}`, ...form.getHeaders() }, maxBodyLength: Infinity }
     );
     return response.data.text || "[Audio no pudo ser transcrito]";
   } catch (err) {
@@ -151,16 +119,11 @@ async function transcribeAudio(audioBuffer) {
 // =====================================================
 // HELPERS
 // =====================================================
-function formatPhoneToJid(phone) {
-  let clean = phone.replace(/\D/g, "");
-  if (!clean.startsWith("56") && clean.length <= 9) {
-    clean = "56" + clean;
-  }
-  return clean + "@s.whatsapp.net";
-}
-
 function extractPhoneFromJid(jid) {
-  return jid.replace("@s.whatsapp.net", "").replace("@g.us", "");
+  if (!jid) return null;
+  if (jid.endsWith("@s.whatsapp.net")) return jid.replace("@s.whatsapp.net", "");
+  // LID format no tiene telefono real
+  return null;
 }
 
 // =====================================================
@@ -189,24 +152,19 @@ async function startBot() {
       connectionStatus = "waiting_qr";
       console.log("[QR] Nuevo QR generado. Escanea en: https://ama-whatsapp-bot.onrender.com/pair");
     }
-
     if (connection === "close") {
       connectionStatus = "disconnected";
       currentQR = null;
       const reason = new Boom(lastDisconnect?.error)?.output?.statusCode;
-
       if (reason === DisconnectReason.loggedOut) {
         console.log("Session logged out. Cleaning and restarting...");
-        if (fs.existsSync(AUTH_DIR)) {
-          fs.rmSync(AUTH_DIR, { recursive: true });
-        }
+        if (fs.existsSync(AUTH_DIR)) fs.rmSync(AUTH_DIR, { recursive: true });
         setTimeout(startBot, 5000);
       } else {
         console.log(`Connection closed (reason: ${reason}). Reconnecting in 5s...`);
         setTimeout(startBot, 5000);
       }
     }
-
     if (connection === "open") {
       connectionStatus = "connected";
       currentQR = null;
@@ -223,8 +181,9 @@ async function startBot() {
       if (msg.key.fromMe) continue;
       if (msg.key.remoteJid?.endsWith("@g.us")) continue;
 
-      const senderPhone = extractPhoneFromJid(msg.key.remoteJid);
-      const senderName = msg.pushName || msg.key.participant || "Cliente";
+      const remoteJid = msg.key.remoteJid;
+      const phone = extractPhoneFromJid(remoteJid);
+      const senderName = msg.pushName || "Cliente";
 
       let messageText = "";
       let messageType = "text";
@@ -236,7 +195,7 @@ async function startBot() {
       } else if (msg.message?.audioMessage) {
         messageType = "audio";
         try {
-          console.log(`[AUDIO] Recibido de ${senderPhone}, transcribiendo...`);
+          console.log(`[AUDIO] Recibido de ${senderName}, transcribiendo...`);
           const audioBuffer = await downloadMediaMessage(msg, "buffer", {});
           messageText = await transcribeAudio(audioBuffer);
           console.log(`[AUDIO] Transcripcion: "${messageText}"`);
@@ -254,20 +213,22 @@ async function startBot() {
 
       if (!messageText) continue;
 
-      console.log(`[MSG] ${senderName} (${senderPhone}): ${messageText}`);
+      console.log(`[MSG] ${senderName} (${remoteJid}): ${messageText}`);
 
+      // Envia al n8n con JID completo + telefono si disponible
       try {
         await axios.post(N8N_WEBHOOK_URL, {
-          phone: senderPhone,
+          jid: remoteJid,
+          phone: phone || "",
           name: senderName,
           message: messageText,
           messageType: messageType,
           timestamp: new Date().toISOString(),
         });
-        console.log(`[N8N] Mensaje enviado al webhook`);
+        console.log(`[N8N] Enviado al webhook OK`);
       } catch (err) {
-        console.error(`[N8N] Error enviando al webhook: ${err.message}`);
-        await sock.sendMessage(msg.key.remoteJid, {
+        console.error(`[N8N] Error: ${err.message}`);
+        await sock.sendMessage(remoteJid, {
           text: "Disculpa, estamos experimentando problemas tecnicos. Por favor intenta nuevamente en unos minutos o contactanos al (+56) 9 7510 2052.",
         });
       }
@@ -277,6 +238,6 @@ async function startBot() {
 
 app.listen(PORT, () => {
   console.log(`\n[SERVER] API corriendo en puerto ${PORT}`);
-  console.log(`[SERVER] Para vincular WhatsApp: https://ama-whatsapp-bot.onrender.com/pair`);
+  console.log(`[SERVER] Vincular: https://ama-whatsapp-bot.onrender.com/pair`);
   startBot();
 });
