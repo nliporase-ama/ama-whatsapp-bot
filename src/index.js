@@ -11,6 +11,7 @@ const pino = require("pino");
 const axios = require("axios");
 const fs = require("fs");
 const path = require("path");
+const QRCode = require("qrcode");
 
 // =====================================================
 // CONFIG
@@ -18,7 +19,6 @@ const path = require("path");
 const PORT = process.env.PORT || 3000;
 const N8N_WEBHOOK_URL = process.env.N8N_WEBHOOK_URL || "https://nickliporase.app.n8n.cloud/webhook/ama-bot-incoming";
 const GROQ_API_KEY = process.env.GROQ_API_KEY || "";
-const PHONE_NUMBER = process.env.PHONE_NUMBER || "";
 const AUTH_DIR = path.join(__dirname, "..", "auth_info");
 
 // =====================================================
@@ -29,8 +29,7 @@ app.use(express.json({ limit: "50mb" }));
 
 let sock = null;
 let connectionStatus = "disconnected";
-let currentPairingCode = null;
-let codeGeneratedAt = null;
+let currentQR = null;
 
 // Health check
 app.get("/", (req, res) => {
@@ -41,45 +40,51 @@ app.get("/", (req, res) => {
   });
 });
 
-// === PAGINA PARA VER EL CODIGO DE VINCULACION ===
-app.get("/pair", (req, res) => {
+// === PAGINA PARA ESCANEAR QR ===
+app.get("/pair", async (req, res) => {
   if (connectionStatus === "connected") {
-    return res.send("<html><body style='font-family:Arial;text-align:center;padding:60px;background:#0a0a0a;color:#0f0'><h1>BOT YA CONECTADO</h1><p>El WhatsApp ya esta vinculado. No necesitas codigo.</p></body></html>");
+    return res.send(`<html><body style="font-family:Arial;text-align:center;padding:60px;background:#0a0a0a;color:#0f0">
+      <h1>BOT CONECTADO</h1>
+      <p>WhatsApp ya esta vinculado. Todo OK.</p>
+    </body></html>`);
   }
-  
-  const html = `
-  <html>
-  <head><meta http-equiv="refresh" content="5"><title>AMA Bot - Vincular</title></head>
-  <body style="font-family:Arial;text-align:center;padding:60px;background:#0a0a0a;color:#fff">
+
+  let qrImage = "";
+  if (currentQR) {
+    try {
+      qrImage = await QRCode.toDataURL(currentQR, { width: 400, margin: 2 });
+    } catch (e) {
+      qrImage = "";
+    }
+  }
+
+  res.send(`<html>
+  <head><meta http-equiv="refresh" content="5"><title>AMA Bot - Vincular WhatsApp</title></head>
+  <body style="font-family:Arial;text-align:center;padding:40px;background:#0a0a0a;color:#fff">
     <h1>AMA Pet WhatsApp Bot</h1>
     <p>Estado: <b style="color:${connectionStatus === 'connected' ? '#0f0' : '#f90'}">${connectionStatus}</b></p>
-    ${currentPairingCode ? `
-      <div style="background:#111;border:2px solid #0f0;border-radius:16px;padding:40px;display:inline-block;margin:20px">
-        <p style="color:#aaa;margin:0">CODIGO DE VINCULACION:</p>
-        <h1 style="font-size:64px;letter-spacing:12px;color:#0f0;margin:10px 0">${currentPairingCode}</h1>
-        <p style="color:#888;font-size:14px">Generado: ${codeGeneratedAt ? new Date(codeGeneratedAt).toLocaleTimeString() : 'N/A'}</p>
+    ${qrImage ? `
+      <div style="background:#fff;border-radius:16px;padding:20px;display:inline-block;margin:20px">
+        <img src="${qrImage}" alt="QR Code" style="width:350px;height:350px"/>
       </div>
       <p style="color:#aaa">1. Abre WhatsApp en tu celular</p>
-      <p style="color:#aaa">2. Dispositivos vinculados > Vincular dispositivo</p>
-      <p style="color:#aaa">3. Toca "Vincular con numero de telefono"</p>
-      <p style="color:#aaa">4. Ingresa el codigo de arriba RAPIDO</p>
+      <p style="color:#aaa">2. Menu > Dispositivos vinculados > Vincular dispositivo</p>
+      <p style="color:#aaa">3. Escanea este QR con la camara</p>
+      <p style="color:#555;font-size:12px">La pagina se refresca cada 5 segundos. Si el QR expira, espera uno nuevo.</p>
     ` : `
-      <p style="color:#f90">Esperando codigo... esta pagina se actualiza sola cada 5 segundos.</p>
+      <p style="color:#f90;font-size:20px">Esperando QR... la pagina se actualiza sola.</p>
+      <p style="color:#555">Si tarda mucho, el bot esta reconectando. Espera unos segundos.</p>
     `}
-    <p style="color:#555;font-size:12px">Esta pagina se refresca automaticamente.</p>
-  </body>
-  </html>`;
-  res.send(html);
+  </body></html>`);
 });
 
-// Endpoint para n8n enviar mensagens
+// Endpoint para n8n enviar mensajes
 app.post("/api/send-message", async (req, res) => {
   try {
     const { phone, message } = req.body;
     if (!phone || !message) {
       return res.status(400).json({ error: "phone and message required" });
     }
-
     const jid = formatPhoneToJid(phone);
     await sock.sendMessage(jid, { text: message });
     res.json({ success: true, to: jid });
@@ -89,14 +94,13 @@ app.post("/api/send-message", async (req, res) => {
   }
 });
 
-// Endpoint para n8n enviar imagens
+// Endpoint para n8n enviar imagenes
 app.post("/api/send-image", async (req, res) => {
   try {
     const { phone, imageUrl, caption } = req.body;
     if (!phone || !imageUrl) {
       return res.status(400).json({ error: "phone and imageUrl required" });
     }
-
     const jid = formatPhoneToJid(phone);
     await sock.sendMessage(jid, {
       image: { url: imageUrl },
@@ -116,7 +120,6 @@ async function transcribeAudio(audioBuffer) {
   if (!GROQ_API_KEY) {
     return "[Audio recibido - transcripcion no disponible]";
   }
-
   try {
     const FormData = (await import("form-data")).default;
     const form = new FormData();
@@ -138,7 +141,6 @@ async function transcribeAudio(audioBuffer) {
         maxBodyLength: Infinity,
       }
     );
-
     return response.data.text || "[Audio no pudo ser transcrito]";
   } catch (err) {
     console.error("Groq transcription error:", err.message);
@@ -173,7 +175,7 @@ async function startBot() {
     auth: state,
     logger: pino({ level: "warn" }),
     printQRInTerminal: false,
-    browser: ["Chrome (Linux)", "", ""],
+    browser: ["AMA Pet Bot", "Chrome", "1.0.0"],
     connectTimeoutMs: 60000,
     defaultQueryTimeoutMs: 0,
     keepAliveIntervalMs: 30000,
@@ -183,27 +185,14 @@ async function startBot() {
 
   sock.ev.on("connection.update", async ({ connection, lastDisconnect, qr }) => {
     if (qr) {
-      if (PHONE_NUMBER && !sock.authState.creds.registered) {
-        try {
-          const code = await sock.requestPairingCode(PHONE_NUMBER);
-          currentPairingCode = code;
-          codeGeneratedAt = Date.now();
-          console.log("\n========================================");
-          console.log("  CODIGO: " + code);
-          console.log("  Ve a: https://ama-whatsapp-bot.onrender.com/pair");
-          console.log("========================================\n");
-        } catch (err) {
-          console.error("Error requesting pairing code:", err.message);
-        }
-      } else {
-        console.log("Configura PHONE_NUMBER en variables de entorno");
-      }
+      currentQR = qr;
       connectionStatus = "waiting_qr";
+      console.log("[QR] Nuevo QR generado. Escanea en: https://ama-whatsapp-bot.onrender.com/pair");
     }
 
     if (connection === "close") {
       connectionStatus = "disconnected";
-      currentPairingCode = null;
+      currentQR = null;
       const reason = new Boom(lastDisconnect?.error)?.output?.statusCode;
 
       if (reason === DisconnectReason.loggedOut) {
@@ -220,7 +209,7 @@ async function startBot() {
 
     if (connection === "open") {
       connectionStatus = "connected";
-      currentPairingCode = null;
+      currentQR = null;
       console.log("\n========================================");
       console.log("  BOT CONECTADO AL WHATSAPP");
       console.log("========================================\n");
@@ -278,7 +267,6 @@ async function startBot() {
         console.log(`[N8N] Mensaje enviado al webhook`);
       } catch (err) {
         console.error(`[N8N] Error enviando al webhook: ${err.message}`);
-
         await sock.sendMessage(msg.key.remoteJid, {
           text: "Disculpa, estamos experimentando problemas tecnicos. Por favor intenta nuevamente en unos minutos o contactanos al (+56) 9 7510 2052.",
         });
@@ -289,9 +277,6 @@ async function startBot() {
 
 app.listen(PORT, () => {
   console.log(`\n[SERVER] API corriendo en puerto ${PORT}`);
-  console.log(`[SERVER] Webhook n8n: ${N8N_WEBHOOK_URL}`);
-  console.log(`[SERVER] Groq API: ${GROQ_API_KEY ? "OK" : "NO"}`);
-  console.log(`[SERVER] Phone: ${PHONE_NUMBER || "NO CONFIGURADO"}`);
-  console.log(`[SERVER] Para vincular: https://ama-whatsapp-bot.onrender.com/pair`);
+  console.log(`[SERVER] Para vincular WhatsApp: https://ama-whatsapp-bot.onrender.com/pair`);
   startBot();
 });
