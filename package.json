@@ -11,8 +11,9 @@
     "simulate:web:live": "node simulator-web.js --live"
   },
   "dependencies": {
-    "@whiskeysockets/baileys": "^6.7.16",
     "@hapi/boom": "^10.0.1",
+    "@supabase/supabase-js": "^2.100.1",
+    "@whiskeysockets/baileys": "^6.7.16",
     "axios": "^1.7.9",
     "express": "^4.21.2",
     "form-data": "^4.0.1",

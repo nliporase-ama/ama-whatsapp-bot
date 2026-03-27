@@ -12,15 +12,11 @@ const express = require("express");
 const axios = require("axios");
 const fs = require("fs");
 const path = require("path");
-const {
-  classifyIntent, cleanName, extractPhone, isPaused, pauseChat, pausedChats,
-  HUMAN_KEYWORDS, TRACKING_KEYWORDS, FALLBACK_MSG, parseCSVLine,
-} = require("./src/index.js");
 
 const LIVE_MODE = process.argv.includes("--live");
 const PORT = 4000;
 
-// Load .env
+// Load .env into process.env BEFORE importing src/index.js
 function loadEnv() {
   const envPath = path.join(__dirname, ".env");
   if (!fs.existsSync(envPath)) return {};
@@ -30,12 +26,21 @@ function loadEnv() {
     if (!trimmed || trimmed.startsWith("#")) return;
     const eq = trimmed.indexOf("=");
     if (eq === -1) return;
-    vars[trimmed.substring(0, eq).trim()] = trimmed.substring(eq + 1).trim();
+    const key = trimmed.substring(0, eq).trim();
+    const val = trimmed.substring(eq + 1).trim();
+    vars[key] = val;
+    if (!process.env[key]) process.env[key] = val;
   });
   return vars;
 }
 
 const env = loadEnv();
+
+const {
+  classifyIntent, looksLikePhone, cleanName, extractPhone, isPaused, pauseChat, pausedChats,
+  HUMAN_KEYWORDS, TRACKING_KEYWORDS, FALLBACK_MSG, parseCSVLine, stripCountryCode, dispatchStore,
+} = require("./src/index.js");
+const { upsertDispatch, fetchDispatches } = require("./src/supabase");
 const GROQ_API_KEY = process.env.GROQ_API_KEY || env.GROQ_API_KEY || "";
 const DISPATCH_API_KEY = process.env.DISPATCH_API_KEY || env.DISPATCH_API_KEY || "";
 const DISPATCH_URL = process.env.DISPATCH_URL || env.DISPATCH_URL || "https://logicold.dispatchtrack.com/api/external/v1/dispatches";
@@ -43,11 +48,7 @@ const N8N_WEBHOOK_URL = process.env.N8N_WEBHOOK_URL || env.N8N_WEBHOOK_URL || ""
 const GOOGLE_SHEET_ID = process.env.GOOGLE_SHEET_ID || env.GOOGLE_SHEET_ID || "";
 const NELLY_PHONE = process.env.NELLY_PHONE || env.NELLY_PHONE || "56996135264";
 
-function stripCountryCode(phone) {
-  if (!phone) return phone;
-  if (phone.startsWith("56") && phone.length > 9) return phone.substring(2);
-  return phone;
-}
+// stripCountryCode importado de src/index.js
 
 // =====================================================
 // STATE
@@ -136,13 +137,34 @@ async function liveFetchDeliveryInfo(phone) {
     if (d.substatus) info += ". Detalle: " + d.substatus;
     if (d.items?.length > 0) info += ". Items: " + d.items.map(i => (i.quantity || 1) + "x " + (i.name || i.description || "Producto")).join(", ");
     return info;
-    }).join(" | ");
-    log("DISPATCH", dispatches.length + " pedidos encontrados");
-    return result;
-  } catch (err) {
-    log("DISPATCH", "ERROR: " + err.message);
-    return "Error consultando entregas.";
+  }).join(" | ");
+
+  // 1) Buscar no dispatchStore local (dados recebidos via webhook)
+  const stored = dispatchStore.get(searchPhone);
+  if (stored && stored.length > 0) {
+    log("DISPATCH", stored.length + " despachos encontrados no store local (short)");
+    return fmtDispatches(stored);
   }
+  const storedFull = dispatchStore.get(phone);
+  if (storedFull && storedFull.length > 0) {
+    log("DISPATCH", storedFull.length + " despachos encontrados no store local (full)");
+    return fmtDispatches(storedFull);
+  }
+
+  // 2) Fallback: Buscar no Supabase (dados persistidos)
+  try {
+    const supabaseData = await fetchDispatches(searchPhone, phone);
+    if (supabaseData && supabaseData.length > 0) {
+      log("DISPATCH", supabaseData.length + " despachos encontrados no Supabase");
+      const rawDispatches = supabaseData.map(d => d.raw_data || d);
+      return fmtDispatches(rawDispatches);
+    }
+  } catch (err) {
+    log("DISPATCH", "Supabase fallback fallo: " + err.message);
+  }
+
+  log("DISPATCH", "Sin datos. Store tiene " + dispatchStore.size + " telefonos");
+  return "No se encontraron pedidos recientes para el telefono " + searchPhone + ". Puedes verificar el numero o escribir \"hablar con ejecutivo\".";
 }
 
 // =====================================================
@@ -185,7 +207,7 @@ function mockCallGroq(systemPrompt, userMessage) {
     if (lower.includes("ingrediente") || lower.includes("natural")) return "100% naturales: proteina animal, verduras frescas, sin preservantes artificiales 🌿";
     if (lower.includes("gato")) return "Si, tenemos linea completa para gatos en sachet y vidrio 🐱";
     if (lower.includes("pago") || lower.includes("transferencia") || lower.includes("tarjeta")) return "Aceptamos transferencia, credito y debito 💳";
-    if (lower.includes("hola") || lower.includes("buenas") || lower.includes("buenos")) return "Hola! Soy el asistente de AMA Pet. En que puedo ayudarte? 🐾";
+    if (lower.includes("hola") || lower.includes("buenas") || lower.includes("buenos")) return "Hola! Soy Luna, la asistente virtual de AMA Pet. ¿En que puedo ayudarte? 🐾";
     return 'No tengo esa info, pero puedo derivarte con un ejecutivo. Escribe "hablar con ejecutivo" 🐾';
   }
   return FALLBACK_MSG;
@@ -215,7 +237,7 @@ async function handleMessage(text, phone, name, jid, isLid) {
     return { botMessages, logs: msgLogs, intent: "paused", paused: true };
   }
 
-  const intent = classifyIntent(text);
+  const intent = classifyIntent(text, jid);
   addLog("INTENT", intent);
 
   if (intent === "human") {
@@ -225,14 +247,17 @@ async function handleMessage(text, phone, name, jid, isLid) {
     const nellyMsg = "🔔 *SOLICITUD DE ATENCION HUMANA*\n\nCliente: " + cleanedName + "\nTelefono: " + (phone || "No disponible (WhatsApp nuevo formato)") + "\nMensaje: " + text + "\n\nEl bot fue pausado 48h para este cliente.";
     await fakeSock.sendMessage(NELLY_PHONE + "@s.whatsapp.net", { text: nellyMsg });
   } else if (intent === "tracking") {
-    const deliveryInfo = LIVE_MODE ? await liveFetchDeliveryInfo(phone) : mockFetchDeliveryInfo(phone);
+    // Si el usuario manda un teléfono como mensaje, usarlo para la búsqueda
+    const phoneFromMessage = looksLikePhone(text) ? text.replace(/[\s\-\+\(\)]/g, "") : null;
+    const searchPhone = phoneFromMessage || phone;
+    const deliveryInfo = LIVE_MODE ? await liveFetchDeliveryInfo(searchPhone) : mockFetchDeliveryInfo(searchPhone);
     addLog("DELIVERY", deliveryInfo.substring(0, 120));
-    const sysPrompt = "Eres Ama Bot, asistente de AMA Pet (alimento natural para mascotas, Chile). Espanol chileno, amigable, profesional. Max 2-3 oraciones. Max 1 emoji. No inventes. INFO DE ENTREGA: " + deliveryInfo + " REGLAS: Si dice TELEFONO_NO_DISPONIBLE, pide su numero de telefono con codigo de pais (ej: +56912345678). NUNCA pidas numero de pedido. En ruta = en camino. Entregado = confirma. No entregado = explica. Siempre ofrece \"hablar con ejecutivo\" si no queda satisfecho.";
+    const sysPrompt = "Eres Luna, la asistente virtual de AMA Pet 🐾. Simpatica y profesional. Espanol chileno. Max 2-3 oraciones. Max 1 emoji. No inventes. INFO DE ENTREGA: " + deliveryInfo + " REGLAS: Si dice TELEFONO_NO_DISPONIBLE, pide amablemente su numero de telefono con codigo de pais (ej: +56912345678). NUNCA pidas numero de pedido. En ruta = en camino, da el ETA si esta disponible. Entregado = confirma con fecha. No entregado = explica el motivo. Si no se encontraron pedidos, sugiere verificar el numero o escribir \"hablar con ejecutivo\". Siempre ofrece \"hablar con ejecutivo\" si el cliente no queda satisfecho.";
     const reply = LIVE_MODE ? await liveCallGroq(sysPrompt, text) : mockCallGroq(sysPrompt, text);
     await fakeSock.sendMessage(jid, { text: reply || FALLBACK_MSG });
   } else {
     const kb = LIVE_MODE ? await liveFetchFAQ() : MOCK_FAQ;
-    const sysPrompt = "Eres Ama Bot, asistente de AMA Pet (alimento 100% natural para perros y gatos, Chile). Espanol chileno, amigable, profesional. Max 2-3 oraciones. Max 1 emoji. No inventes. No saludes por nombre a menos que el cliente diga su nombre. Contacto: (+56) 9 7510 2052, ama.pet. Lunes a viernes 9-18h. Congelados descontinuados abril 2026. Solo sachet y vidrio. BASE DE CONOCIMIENTO: " + kb + " REGLAS: 1) Solo info de la base. 2) Si no sabes, ofrece derivar con ejecutivo. 3) Pedidos/entregas: diles que escriban 'donde esta mi pedido'. 4) NUNCA pidas numero de pedido.";
+    const sysPrompt = "Eres Luna, la asistente virtual de AMA Pet 🐾. Eres simpatica, carinosa y apasionada por los animales. Hablas en espanol chileno, con tono amigable y profesional. Cuando alguien te saluda, presentate brevemente: 'Hola! Soy Luna, la asistente virtual de AMA Pet. ¿En que puedo ayudarte?' AMA Pet elabora alimento humedo, cocido y 100% natural para perros y gatos en Chile. Contacto: (+56) 9 7510 2052, ama.pet. Horario: lunes a viernes 9-18h. Los congelados fueron descontinuados en abril 2026. Solo se venden sachets y frascos de vidrio. Max 2-3 oraciones por respuesta. Max 1 emoji. No inventes informacion. BASE DE CONOCIMIENTO: " + kb + " REGLAS: 1) Solo responde con info de la base de conocimiento. 2) Si no sabes la respuesta, di que vas a derivar con un ejecutivo y ofrece 'hablar con ejecutivo'. 3) Si preguntan por pedidos/entregas, diles que escriban 'donde esta mi pedido' o 'consultar mi pedido'. 4) NUNCA pidas numero de pedido. 5) Si el cliente manda solo un numero, pregunta en que puedes ayudarlo.";
     const reply = LIVE_MODE ? await liveCallGroq(sysPrompt, text) : mockCallGroq(sysPrompt, text);
     await fakeSock.sendMessage(jid, { text: reply || FALLBACK_MSG });
   }
@@ -245,6 +270,54 @@ async function handleMessage(text, phone, name, jid, isLid) {
 // =====================================================
 const app = express();
 app.use(express.json());
+
+// Webhook endpoint para receber dados do DispatchTrack (igual ao bot real)
+app.post("/webhook/dispatch", (req, res) => {
+  try {
+    const data = req.body;
+    log("WEBHOOK", "Dispatch recebido: " + JSON.stringify(data).substring(0, 200));
+    const dispatches = [];
+    if (data.dispatches) {
+      dispatches.push(...(Array.isArray(data.dispatches) ? data.dispatches : [data.dispatches]));
+    } else if (data.identifier && data.contact_phone) {
+      dispatches.push(data);
+    } else if (data.route?.dispatches) {
+      dispatches.push(...data.route.dispatches);
+    } else if (data.response?.dispatches) {
+      dispatches.push(...data.response.dispatches);
+    } else if (data.response?.route?.dispatches) {
+      dispatches.push(...data.response.route.dispatches);
+    }
+    let stored = 0;
+    for (const d of dispatches) {
+      if (!d.contact_phone) continue;
+      const phone = d.contact_phone.replace(/[^0-9]/g, "");
+      const phoneShort = stripCountryCode(phone);
+      for (const key of [phone, phoneShort]) {
+        if (!dispatchStore.has(key)) dispatchStore.set(key, []);
+        const list = dispatchStore.get(key);
+        const idx = list.findIndex(x => x.identifier === d.identifier);
+        if (idx >= 0) list[idx] = d;
+        else list.push(d);
+      }
+      // Persistir no Supabase
+      upsertDispatch(d, phoneShort, phone);
+      stored++;
+    }
+    log("WEBHOOK", stored + " despachos armazenados. Total telefonos: " + dispatchStore.size);
+    res.json({ status: "ok", stored });
+  } catch (err) {
+    log("WEBHOOK", "ERROR: " + err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Status do dispatchStore
+app.get("/webhook/dispatch/status", (req, res) => {
+  const data = {};
+  dispatchStore.forEach((v, k) => { data[k] = v; });
+  res.json({ totalPhones: dispatchStore.size, data });
+});
 
 app.get("/", (req, res) => {
   res.send(`<!DOCTYPE html>

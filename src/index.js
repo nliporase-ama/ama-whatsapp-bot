@@ -12,6 +12,7 @@ const axios = require("axios");
 const fs = require("fs");
 const path = require("path");
 const QRCode = require("qrcode");
+const { upsertDispatch, fetchDispatches, loadRecentDispatches } = require("./supabase");
 
 // =====================================================
 // CONFIG
@@ -134,13 +135,30 @@ const TRACKING_KEYWORDS = [
   "cuando llega", "cuándo llega", "ya viene", "en camino",
   "ruta", "tracking", "rastreo", "rastrear", "seguimiento",
   "no ha llegado", "no llego", "no llegó", "demora",
-  "orden", "paquete"
+  "orden", "paquete", "consultar mi pedido", "mi pedido",
+  "estado de mi", "numero de seguimiento"
 ];
 
-function classifyIntent(text) {
+// Detecta si el texto es un número de teléfono chileno
+function looksLikePhone(text) {
+  const cleaned = text.replace(/[\s\-\+\(\)]/g, "");
+  return /^(56)?9\d{8}$/.test(cleaned) || /^\d{8,12}$/.test(cleaned);
+}
+
+// Estado de conversación: trackea si el último intent fue tracking para contexto
+const lastIntent = new Map();
+
+function classifyIntent(text, jid) {
   const lower = text.toLowerCase();
   if (HUMAN_KEYWORDS.some(kw => lower.includes(kw))) return "human";
-  if (TRACKING_KEYWORDS.some(kw => lower.includes(kw))) return "tracking";
+  if (TRACKING_KEYWORDS.some(kw => lower.includes(kw))) {
+    if (jid) lastIntent.set(jid, "tracking");
+    return "tracking";
+  }
+  // Si el usuario manda un teléfono y el último intent fue tracking, es seguimiento
+  if (looksLikePhone(text) && jid && lastIntent.get(jid) === "tracking") {
+    return "tracking";
+  }
   return "general";
 }
 
@@ -216,20 +234,28 @@ async function fetchDeliveryInfo(phone) {
     return formatDispatches(storedFull);
   }
 
-  // 2) Fallback: API directa de DispatchTrack
-  if (DISPATCH_API_KEY) {
-    try {
-      const resp = await axios.get(DISPATCH_URL, {
-        params: { i: searchPhone, rd: 30 },
-        headers: { "X-AUTH-TOKEN": DISPATCH_API_KEY, "Content-Type": "application/json" },
-        timeout: 15000,
-      });
-      const dispatches = Array.isArray(resp.data) ? resp.data : [];
-      if (dispatches.length === 0) return "No se encontraron pedidos recientes para el telefono " + searchPhone + ".";
-      return formatDispatches(dispatches);
-    } catch (err) {
-      console.error("[DISPATCH] API directa fallo:", err.message);
+  // 2) Fallback: Buscar no Supabase (dados persistidos)
+  try {
+    const supabaseData = await fetchDispatches(searchPhone, phone);
+    if (supabaseData && supabaseData.length > 0) {
+      console.log(`[DISPATCH] ${supabaseData.length} despachos encontrados no Supabase`);
+      // Popular o cache local com os dados do Supabase
+      for (const d of supabaseData) {
+        const raw = d.raw_data || d;
+        for (const key of [d.phone_short, d.phone_full].filter(Boolean)) {
+          if (!dispatchStore.has(key)) dispatchStore.set(key, []);
+          const list = dispatchStore.get(key);
+          const idx = list.findIndex(x => x.identifier === d.identifier);
+          if (idx >= 0) list[idx] = raw;
+          else list.push(raw);
+        }
+      }
+      // Usar raw_data (formato original do DispatchTrack) pra formatar
+      const rawDispatches = supabaseData.map(d => d.raw_data || d);
+      return formatDispatches(rawDispatches);
     }
+  } catch (err) {
+    console.error("[DISPATCH] Supabase fallback fallo:", err.message);
   }
 
   return "No se encontraron pedidos recientes. Si tu pedido es reciente, por favor intenta mas tarde o escribe \"hablar con ejecutivo\".";
@@ -316,14 +342,18 @@ async function handleHuman(jid, phone, name, message) {
 }
 
 async function handleTracking(jid, phone, message) {
-  const deliveryInfo = await fetchDeliveryInfo(phone);
+  // Si el usuario manda un teléfono como mensaje, usarlo para la búsqueda
+  const phoneFromMessage = looksLikePhone(message) ? message.replace(/[\s\-\+\(\)]/g, "") : null;
+  const searchPhone = phoneFromMessage || phone;
+  const deliveryInfo = await fetchDeliveryInfo(searchPhone);
   const sysPrompt =
-    "Eres Ama Bot, asistente de AMA Pet (alimento natural para mascotas, Chile). " +
-    "Espanol chileno, amigable, profesional. Max 2-3 oraciones. Max 1 emoji. No inventes. " +
+    "Eres Luna, la asistente virtual de AMA Pet 🐾. Simpatica y profesional. Espanol chileno. " +
+    "Max 2-3 oraciones. Max 1 emoji. No inventes. " +
     "INFO DE ENTREGA: " + deliveryInfo + " " +
-    "REGLAS: Si dice TELEFONO_NO_DISPONIBLE, pide su numero de telefono con codigo de pais (ej: +56912345678). " +
-    "NUNCA pidas numero de pedido. En ruta = en camino. Entregado = confirma. No entregado = explica. " +
-    'Siempre ofrece "hablar con ejecutivo" si no queda satisfecho.';
+    "REGLAS: Si dice TELEFONO_NO_DISPONIBLE, pide amablemente su numero de telefono con codigo de pais (ej: +56912345678). " +
+    "NUNCA pidas numero de pedido. En ruta = en camino, da el ETA si esta disponible. Entregado = confirma con fecha. No entregado = explica el motivo. " +
+    'Si no se encontraron pedidos, sugiere verificar el numero o escribir "hablar con ejecutivo". ' +
+    'Siempre ofrece "hablar con ejecutivo" si el cliente no queda satisfecho.';
 
   const reply = await callGroq(sysPrompt, message);
   await sock.sendMessage(jid, { text: reply || FALLBACK_MSG });
@@ -332,14 +362,19 @@ async function handleTracking(jid, phone, message) {
 async function handleGeneral(jid, message) {
   const kb = await fetchFAQ();
   const sysPrompt =
-    "Eres Ama Bot, asistente de AMA Pet (alimento 100% natural para perros y gatos, Chile). " +
-    "Espanol chileno, amigable, profesional. Max 2-3 oraciones. Max 1 emoji. No inventes. " +
-    "No saludes por nombre a menos que el cliente diga su nombre. " +
-    "Contacto: (+56) 9 7510 2052, ama.pet. Lunes a viernes 9-18h. " +
-    "Congelados descontinuados abril 2026. Solo sachet y vidrio. " +
+    "Eres Luna, la asistente virtual de AMA Pet 🐾. Eres simpatica, carinosa y apasionada por los animales. " +
+    "Hablas en espanol chileno, con tono amigable y profesional. " +
+    "Cuando alguien te saluda, presentate brevemente: 'Hola! Soy Luna, la asistente virtual de AMA Pet. ¿En que puedo ayudarte?' " +
+    "AMA Pet elabora alimento humedo, cocido y 100% natural para perros y gatos en Chile. " +
+    "Contacto: (+56) 9 7510 2052, ama.pet. Horario: lunes a viernes 9-18h. " +
+    "Los congelados fueron descontinuados en abril 2026. Solo se venden sachets y frascos de vidrio. " +
+    "Max 2-3 oraciones por respuesta. Max 1 emoji. No inventes informacion. " +
     "BASE DE CONOCIMIENTO: " + kb + " " +
-    "REGLAS: 1) Solo info de la base. 2) Si no sabes, ofrece derivar con ejecutivo. " +
-    "3) Pedidos/entregas: diles que escriban 'donde esta mi pedido'. 4) NUNCA pidas numero de pedido.";
+    "REGLAS: 1) Solo responde con info de la base de conocimiento. " +
+    "2) Si no sabes la respuesta, di que vas a derivar con un ejecutivo y ofrece 'hablar con ejecutivo'. " +
+    "3) Si preguntan por pedidos/entregas, diles que escriban 'donde esta mi pedido' o 'consultar mi pedido'. " +
+    "4) NUNCA pidas numero de pedido. " +
+    "5) Si el cliente manda solo un numero, pregunta en que puedes ayudarlo.";
 
   const reply = await callGroq(sysPrompt, message);
   await sock.sendMessage(jid, { text: reply || FALLBACK_MSG });
@@ -353,7 +388,7 @@ async function processMessage(jid, phone, name, text) {
     console.log(`[PAUSED] ${jid} ignorado`);
     return;
   }
-  const intent = classifyIntent(text);
+  const intent = classifyIntent(text, jid);
   console.log(`[INTENT] ${intent} | ${name} | ${text.substring(0, 60)}`);
 
   switch (intent) {
@@ -435,7 +470,7 @@ app.post("/webhook/dispatch", (req, res) => {
       const phone = d.contact_phone.replace(/[^0-9]/g, "");
       const phoneShort = stripCountryCode(phone);
 
-      // Guardar indexado por telefone (sem e com codigo de pais)
+      // Guardar indexado por telefone (sem e com codigo de pais) — cache local
       for (const key of [phone, phoneShort]) {
         if (!dispatchStore.has(key)) dispatchStore.set(key, []);
         const list = dispatchStore.get(key);
@@ -444,6 +479,9 @@ app.post("/webhook/dispatch", (req, res) => {
         if (idx >= 0) list[idx] = d;
         else list.push(d);
       }
+
+      // Persistir no Supabase (async, não bloqueia resposta do webhook)
+      upsertDispatch(d, phoneShort, phone);
       stored++;
     }
 
@@ -560,12 +598,35 @@ process.on("SIGINT", () => gracefulShutdown("SIGINT"));
 // =====================================================
 // START
 // =====================================================
+async function warmUpCache() {
+  try {
+    const dispatches = await loadRecentDispatches();
+    for (const d of dispatches) {
+      const raw = d.raw_data || d;
+      for (const key of [d.phone_short, d.phone_full].filter(Boolean)) {
+        if (!dispatchStore.has(key)) dispatchStore.set(key, []);
+        const list = dispatchStore.get(key);
+        const idx = list.findIndex(x => x.identifier === d.identifier);
+        if (idx >= 0) list[idx] = raw;
+        else list.push(raw);
+      }
+    }
+    console.log(`[CACHE] ${dispatchStore.size} telefones no cache`);
+  } catch (err) {
+    console.error("[CACHE] Warm-up falhou:", err.message);
+  }
+}
+
 if (require.main === module) {
-  app.listen(PORT, () => { console.log(`[SERVER] Puerto ${PORT}`); startBot(); });
+  app.listen(PORT, async () => {
+    console.log(`[SERVER] Puerto ${PORT}`);
+    await warmUpCache();
+    startBot();
+  });
 }
 
 module.exports = {
-  classifyIntent, cleanName, extractPhone, isPaused, pauseChat, pausedChats,
+  classifyIntent, looksLikePhone, cleanName, extractPhone, isPaused, pauseChat, pausedChats,
   HUMAN_KEYWORDS, TRACKING_KEYWORDS, FALLBACK_MSG, parseCSVLine,
   stripCountryCode, dispatchStore,
 };
